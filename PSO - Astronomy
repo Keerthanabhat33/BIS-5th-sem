@@ -1,0 +1,194 @@
+import numpy as np
+
+# =============================================================================
+# VARIABLE STAR PERIOD DETECTION USING ORIGINAL PSO STRUCTURE
+# =============================================================================
+
+# First, let's create synthetic variable star data
+def create_variable_star_data():
+    """Generate synthetic variable star observations"""
+    time = np.linspace(0, 30, 100)  # 30 days, 100 observations
+    true_period = 2.5  # days
+    true_amplitude = 0.3  # magnitude
+    true_mean_mag = 12.0
+    
+    # Create sinusoidal light curve with noise
+    magnitude = true_mean_mag + true_amplitude * np.sin(2 * np.pi * time / true_period)
+    magnitude += np.random.normal(0, 0.05, len(time))  # Add observational noise
+    
+    return time, magnitude, true_period
+
+# Create the data (this would normally be loaded from observations)
+time_data, mag_data, true_period = create_variable_star_data()
+
+# --- Define the Variable Star Objective Function ---
+def variable_star_objective(X):
+    """
+    Objective function for variable star period detection
+    X[0] = period (in days)
+    For multi-dimensional, X could include [period, amplitude, phase, etc.]
+    """
+    period = X[0]  # We're only optimizing period for simplicity
+    
+    # Check bounds
+    if period <= 0 or period > 10:
+        return 1000.0  # Very bad fitness for invalid periods
+    
+    # Fold the data by the trial period
+    phase = (time_data % period) / period
+    
+    # Fit a sinusoidal model to the phased data
+    try:
+        # Simple sine wave fitting using least squares
+        A_matrix = np.column_stack([
+            np.ones(len(phase)),
+            np.sin(2 * np.pi * phase),
+            np.cos(2 * np.pi * phase)
+        ])
+        
+        coeffs = np.linalg.lstsq(A_matrix, mag_data, rcond=None)[0]
+        model_mag = A_matrix @ coeffs
+        chi_square = np.sum((mag_data - model_mag)**2)
+        
+        return chi_square
+    except:
+        return 1000.0
+
+# =============================================================================
+# EXACT INPUT VALUES FOR VARIABLE STAR PROBLEM
+# =============================================================================
+
+print("="*60)
+print("VARIABLE STAR PERIOD DETECTION - PSO INPUT VALUES")
+print("="*60)
+print()
+print("When prompted by the original PSO code, enter these values:")
+print()
+print("Enter number of particles (e.g. 30): 25")
+print("   → Reason: 25-30 particles work well for 1D optimization")
+print()
+print("Enter number of dimensions (e.g. 2): 1") 
+print("   → Reason: We're only optimizing the period (1 parameter)")
+print()
+print("Enter number of iterations (e.g. 100): 50")
+print("   → Reason: Period detection usually converges quickly")
+print()
+print("Enter lower bound (e.g. -5.12): 0.1")
+print("   → Reason: Shortest reasonable period for variable stars")
+print()
+print("Enter upper bound (e.g. 5.12): 10.0")
+print("   → Reason: Longest period we want to search for")
+print()
+print("="*60)
+
+# =============================================================================
+# SIMULATION OF THE ORIGINAL CODE WITH THESE VALUES
+# =============================================================================
+
+print("SIMULATED OUTPUT:")
+print("="*60)
+
+# Simulate user inputs
+num_particles = 25
+num_dimensions = 1
+num_iterations = 50
+lower_bound = 0.1
+upper_bound = 10.0
+bounds = (lower_bound, upper_bound)
+
+# PSO coefficients
+w = 0.5
+c1 = 1.5
+c2 = 1.5
+
+print(f"Using: {num_particles} particles, {num_dimensions} dimension(s), {num_iterations} iterations")
+print(f"Search range: {lower_bound} to {upper_bound} days")
+print(f"True period: {true_period} days")
+print()
+
+# --- Define Particle Class (adapted for variable star) ---
+class Particle:
+    def __init__(self):
+        self.position = np.random.uniform(bounds[0], bounds[1], num_dimensions)
+        self.velocity = np.random.uniform(-1, 1, num_dimensions)
+        self.best_position = np.copy(self.position)
+        self.best_score = variable_star_objective(self.position)
+
+# --- Initialize Swarm ---
+swarm = [Particle() for _ in range(num_particles)]
+global_best_position = min(swarm, key=lambda p: p.best_score).best_position
+global_best_score = variable_star_objective(global_best_position)
+
+print(f"Initial best period: {global_best_position[0]:.3f} days (score: {global_best_score:.4f})")
+print()
+
+# --- PSO Loop ---
+for iteration in range(num_iterations):
+    for particle in swarm:
+        fitness = variable_star_objective(particle.position)
+        # Update personal best
+        if fitness < particle.best_score:
+            particle.best_score = fitness
+            particle.best_position = np.copy(particle.position)
+        # Update global best
+        if fitness < global_best_score:
+            global_best_score = fitness
+            global_best_position = np.copy(particle.position)
+    
+    for particle in swarm:
+        r1 = np.random.rand(num_dimensions)
+        r2 = np.random.rand(num_dimensions)
+        cognitive = c1 * r1 * (particle.best_position - particle.position)
+        social = c2 * r2 * (global_best_position - particle.position)
+        particle.velocity = w * particle.velocity + cognitive + social
+        particle.position += particle.velocity
+        # Keep position within bounds
+        particle.position = np.clip(particle.position, bounds[0], bounds[1])
+    
+    # Print every 10 iterations
+    if (iteration + 1) % 10 == 0:
+        print(f"Iteration {iteration + 1}/{num_iterations}, Global Best Score: {global_best_score:.4f}, Best Period: {global_best_position[0]:.4f} days")
+
+# --- Final Output ---
+print()
+print("Optimization Complete")
+print(f"Best position found: [{global_best_position[0]:.4f}] days")
+print(f"Best score: {global_best_score:.4f}")
+print()
+print("="*60)
+print("RESULTS ANALYSIS:")
+print(f"True period:     {true_period:.3f} days")
+print(f"PSO found:       {global_best_position[0]:.3f} days")
+print(f"Absolute error:  {abs(global_best_position[0] - true_period):.3f} days")
+print(f"Percentage error: {abs(global_best_position[0] - true_period)/true_period*100:.1f}%")
+
+if abs(global_best_position[0] - true_period) < 0.1:
+    print("✅ EXCELLENT: PSO found the period very accurately!")
+elif abs(global_best_position[0] - true_period) < 0.5:
+    print("✅ GOOD: PSO found a reasonable approximation of the period")
+else:
+    print("⚠️  Could be improved - try more particles or iterations")
+
+print("="*60)
+
+# =============================================================================
+# COMPARISON WITH DIFFERENT PARAMETER SETS
+# =============================================================================
+
+print("\nCOMPARISON: Different Input Values for Variable Star Problems")
+print("="*60)
+print("Problem Type              | Particles | Dimensions | Iterations | Lower | Upper")
+print("-"*60)
+print("Single period detection   |    25     |     1      |     50     |  0.1  |  10.0")
+print("Period + amplitude        |    30     |     2      |     75     |  0.1  |  10.0") 
+print("Period + amp + phase      |    40     |     3      |    100     |  0.1  |  10.0")
+print("Multi-star system         |    50     |     2      |    150     |  0.1  |  20.0")
+print("Binary star periods       |    60     |     4      |    200     |  0.1  |  50.0")
+print("="*60)
+
+print("\nKEY POINTS:")
+print("• Dimensions = number of parameters you're optimizing")
+print("• For basic period detection, use 1 dimension")
+print("• Bounds should reflect physically reasonable periods")
+print("• Variable stars typically have periods from hours to years")
+print("• More complex problems need more particles and iterations")
