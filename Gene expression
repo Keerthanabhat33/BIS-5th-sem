@@ -1,0 +1,86 @@
+import numpy as np
+import random
+
+
+def fitness_function(phenotype):
+    return -sum(x**2 for x in phenotype)  # Sphere function (we maximize negative for minimization)
+
+
+print("=== Gene Expression Algorithm Setup ===")
+POPULATION_SIZE = int(input("Enter population size (e.g., 50): "))
+NUM_GENES = int(input("Enter number of genes (dimensions, e.g., 5): "))
+GENE_MIN = float(input("Enter minimum gene value (e.g., -5.0): "))
+GENE_MAX = float(input("Enter maximum gene value (e.g., 5.0): "))
+MUTATION_RATE = float(input("Enter mutation rate (e.g., 0.1): "))
+CROSSOVER_RATE = float(input("Enter crossover rate (e.g., 0.7): "))
+GENERATIONS = int(input("Enter number of generations (e.g., 100): "))
+
+
+def initialize_population():
+    return [np.random.uniform(GENE_MIN, GENE_MAX, NUM_GENES) for _ in range(POPULATION_SIZE)]
+
+
+def evaluate_population(population):
+    return [fitness_function(individual) for individual in population]
+
+
+def tournament_selection(population, fitnesses, tournament_size=3):
+    selected = []
+    for _ in range(POPULATION_SIZE):
+        competitors = random.sample(list(zip(population, fitnesses)), tournament_size)
+        winner = max(competitors, key=lambda x: x[1])[0]
+        selected.append(np.copy(winner))
+    return selected
+
+
+def crossover(parent1, parent2):
+    if random.random() < CROSSOVER_RATE:
+        mask = np.random.randint(0, 2, size=NUM_GENES).astype(bool)
+        child1 = np.where(mask, parent1, parent2)
+        child2 = np.where(mask, parent2, parent1)
+        return child1, child2
+    else:
+        return np.copy(parent1), np.copy(parent2)
+
+
+def mutate(individual):
+    for i in range(NUM_GENES):
+        if random.random() < MUTATION_RATE:
+            individual[i] += np.random.normal(0, 1)
+            individual[i] = np.clip(individual[i], GENE_MIN, GENE_MAX)
+    return individual
+
+
+def gene_expression_algorithm():
+    population = initialize_population()
+    best_individual = None
+    best_fitness = float('-inf')
+
+    for generation in range(GENERATIONS):
+        fitnesses = evaluate_population(population)
+
+        max_fit = max(fitnesses)
+        if max_fit > best_fitness:
+            best_fitness = max_fit
+            best_individual = population[fitnesses.index(max_fit)]
+
+        print(f"Generation {generation + 1}, Best Fitness: {best_fitness:.4f}")
+
+        selected = tournament_selection(population, fitnesses)
+
+        next_generation = []
+        for i in range(0, POPULATION_SIZE, 2):
+            parent1 = selected[i]
+            parent2 = selected[i + 1 if i + 1 < POPULATION_SIZE else 0]
+            child1, child2 = crossover(parent1, parent2)
+            next_generation.append(mutate(child1))
+            next_generation.append(mutate(child2))
+
+        population = next_generation[:POPULATION_SIZE]
+
+    print("\n=== Optimization Complete ===")
+    print("Best Individual (Solution):", best_individual)
+    print("Best Fitness (minimized value):", -best_fitness)
+
+
+gene_expression_algorithm()
