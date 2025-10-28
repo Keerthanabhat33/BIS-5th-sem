@@ -1,0 +1,432 @@
+import sys
+import os
+import numpy as np
+import cv2
+from skimage.segmentation import slic
+from skimage.color import rgb2lab
+from sklearn.cluster import KMeans
+from collections import defaultdict
+from multiprocessing import Pool, cpu_count
+import math
+
+def image_to_superpixels(img, n_segments=1000, compactness=10):
+    # img: RGB [H,W,3] 0-255
+    segments = slic(img, n_segments=n_segments, compactness=compactness, start_label=0)
+    return segments
+
+def compute_superpixel_features(img, segments, include_position=True):
+    # img: RGB 0-255
+    lab = rgb2lab(img.astype(np.float64) / 255.0)
+    H, W = segments.shape
+    n_segments = segments.max() + 1
+    feats = np.zeros((n_segments, 3 + (2 if include_position else 0)), dtype=np.float32)
+    counts = np.zeros(n_segments, dtype=np.int32)
+
+    ys, xs = np.indices(segments.shape)
+    for y in range(H):
+        for x in range(W):
+            s = segments[y, x]
+            feats[s, 0:3] += lab[y, x]
+            if include_position:
+                feats[s, 3] += x / W
+                feats[s, 4] += y / H
+            counts[s] += 1
+    # average
+    for s in range(n_segments):
+        if counts[s] > 0:
+            feats[s] /= counts[s]
+    return feats, counts
+
+def build_adjacency(segments):
+    H, W = segments.shape
+    n_segments = segments.max() + 1
+    neighbors = [set() for _ in range(n_segments)]
+    # check right and down neighbors for boundaries
+    for y in range(H):
+        for x in range(W):
+            cur = segments[y, x]
+            if x+1 < W:
+                nb = segments[y, x+1]
+                if nb != cur:
+                    neighbors[cur].add(nb); neighbors[nb].add(cur)
+            if y+1 < H:
+                nb = segments[y+1, x]
+                if nb != cur:
+                    neighbors[cur].add(nb); neighbors[nb].add(cur)
+    # convert sets to lists
+    neighbors = [list(s) for s in neighbors]
+    return neighbors
+
+def compute_boundary_strengths(img, segments):
+    # Use gradient magnitude as boundary strength between adjacent superpixels
+    gray = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.hypot(gx, gy)
+    H, W = segments.shape
+    n_segments = segments.max() + 1
+    boundary_sum = defaultdict(float)
+    boundary_count = defaultdict(int)
+    # accumulate gradient along boundaries
+    for y in range(H):
+        for x in range(W):
+            cur = segments[y, x]
+            if x+1 < W:
+                nb = segments[y, x+1]
+                if nb != cur:
+                    key = tuple(sorted((cur, nb)))
+                    boundary_sum[key] += grad[y,x]
+                    boundary_count[key] += 1
+            if y+1 < H:
+                nb = segments[y+1, x]
+                if nb != cur:
+                    key = tuple(sorted((cur, nb)))
+                    boundary_sum[key] += grad[y,x]
+                    boundary_count[key] += 1
+    # produce a dict mapping pair -> strength (normalized)
+    strengths = {}
+    for k, ssum in boundary_sum.items():
+        strengths[k] = ssum / (boundary_count[k] + 1e-6)
+    # normalize strengths to [0,1]
+    if strengths:
+        vals = np.array(list(strengths.values()))
+        mn, mx = vals.min(), vals.max()
+        if mx - mn > 1e-6:
+            for k in strengths:
+                strengths[k] = (strengths[k] - mn) / (mx - mn)
+        else:
+            for k in strengths:
+                strengths[k] = 1.0
+    return strengths
+
+def init_labels_by_kmeans(feats, K=5, seed=0):
+    km = KMeans(n_clusters=K, random_state=seed, n_init=10)
+    lbls = km.fit_predict(feats)
+    centers = km.cluster_centers_
+    return lbls, centers
+
+def unary_energy(feat, label, centers, sigma=1.0):
+    # squared euclidean distance (scaled)
+    return np.sum((feat - centers[label])**2) / (2.0 * (sigma**2) + 1e-12)
+
+def calculate_fitness(feats, labels, neighbors, strengths, centers, K, smoothness_weight, sigma):
+    """
+    Calculate total fitness (lower is better)
+    Fitness = Data Term + Smoothness Term
+    """
+    n_segments = len(labels)
+    
+    # Data term: sum of distances from features to their cluster centers
+    data_energy = 0.0
+    for s in range(n_segments):
+        data_energy += unary_energy(feats[s], labels[s], centers, sigma=sigma)
+    
+    # Smoothness term: penalize different labels on adjacent superpixels
+    smooth_energy = 0.0
+    counted_pairs = set()
+    for s in range(n_segments):
+        for nb in neighbors[s]:
+            pair = tuple(sorted((s, nb)))
+            if pair not in counted_pairs:
+                counted_pairs.add(pair)
+                bstr = strengths.get(pair, 1.0)
+                if labels[s] != labels[nb]:
+                    smooth_energy += (1.0 - bstr)
+    
+    total_energy = data_energy + smoothness_weight * smooth_energy
+    
+    # Calculate additional metrics
+    intra_cluster_variance = data_energy / n_segments
+    boundary_violations = smooth_energy
+    
+    return {
+        'total_energy': total_energy,
+        'data_energy': data_energy,
+        'smooth_energy': smooth_energy,
+        'intra_cluster_variance': intra_cluster_variance,
+        'boundary_violations': boundary_violations,
+        'fitness': total_energy  # Lower is better
+    }
+
+def update_chunk(args):
+    # This function runs in worker processes
+    (chunk_idxs, feats, labels_snapshot, centers, neighbors, strengths, K, smoothness_weight, sigma) = args
+    new_labels = {}
+    for s in chunk_idxs:
+        best_label = labels_snapshot[s]
+        best_energy = float('inf')
+        for k in range(K):
+            data_e = unary_energy(feats[s], k, centers, sigma=sigma)
+            smooth_e = 0.0
+            for nb in neighbors[s]:
+                pair = tuple(sorted((s, nb)))
+                bstr = strengths.get(pair, 1.0)  # default boundary strength
+                # penalize label difference; weight by boundary strength (strong edge -> less penalty)
+                same = 0 if k != labels_snapshot[nb] else 1
+                # cost = (1 - bstr) * (k != label_nb)
+                smooth_e += (1.0 - bstr) * (0 if same else 1.0)
+            total = data_e + smoothness_weight * smooth_e
+            if total < best_energy:
+                best_energy = total
+                best_label = k
+        new_labels[s] = best_label
+    return new_labels
+
+def parallel_cellular_optimization(feats, neighbors, strengths, init_labels, K=5,
+                                   smoothness_weight=0.5, sigma=10.0,
+                                   max_iters=30, n_workers=None):
+    n_segments = feats.shape[0]
+    labels = init_labels.copy()
+    if n_workers is None:
+        n_workers = max(1, cpu_count() - 1)
+    # pre-split indices into chunks
+    chunk_size = max(1, n_segments // (n_workers * 4))  # heuristic
+    chunks = [list(range(i, min(n_segments, i + chunk_size))) for i in range(0, n_segments, chunk_size)]
+
+    # Track fitness history
+    fitness_history = []
+    best_fitness = float('inf')
+    best_labels = labels.copy()
+    best_centers = None
+    best_iteration = 0
+
+    for it in range(max_iters):
+        labels_snapshot = labels.copy()
+        # compute centers (re-estimate cluster centers as means of assigned feats)
+        centers = np.zeros((K, feats.shape[1]), dtype=np.float64)
+        counts = np.zeros(K, dtype=np.int32)
+        for s in range(n_segments):
+            centers[labels[s]] += feats[s]
+            counts[labels[s]] += 1
+        for k in range(K):
+            if counts[k] > 0:
+                centers[k] /= counts[k]
+            else:
+                centers[k] = feats[np.random.randint(0, n_segments)]
+
+        # Calculate fitness before update
+        metrics = calculate_fitness(feats, labels, neighbors, strengths, centers, K, smoothness_weight, sigma)
+        fitness_history.append(metrics)
+        
+        # Track best solution
+        if metrics['fitness'] < best_fitness:
+            best_fitness = metrics['fitness']
+            best_labels = labels.copy()
+            best_centers = centers.copy()
+            best_iteration = it
+
+        # prepare args for workers
+        args_list = []
+        for chunk in chunks:
+            args_list.append((chunk, feats, labels_snapshot, centers, neighbors, strengths, K, smoothness_weight, sigma))
+
+        with Pool(processes=n_workers) as pool:
+            results = pool.map(update_chunk, args_list)
+
+        # combine results
+        changed = 0
+        for r in results:
+            for s, lbl in r.items():
+                if labels[s] != lbl:
+                    labels[s] = lbl
+                    changed += 1
+
+        print(f"Iter {it+1}: changed={changed}, fitness={metrics['fitness']:.2f}, "
+              f"data_energy={metrics['data_energy']:.2f}, smooth_energy={metrics['smooth_energy']:.2f}")
+        
+        if changed == 0:
+            print(f"Converged at iteration {it+1}")
+            break
+    
+    # Calculate final fitness
+    final_metrics = calculate_fitness(feats, labels, neighbors, strengths, centers, K, smoothness_weight, sigma)
+    fitness_history.append(final_metrics)
+    
+    # Print summary
+    print("\n" + "="*70)
+    print("🏆 OPTIMIZATION SUMMARY")
+    print("="*70)
+    print(f"Best Fitness: {best_fitness:.4f} (at iteration {best_iteration + 1})")
+    print(f"Final Fitness: {final_metrics['fitness']:.4f}")
+    print(f"Total Iterations: {len(fitness_history)}")
+    print(f"\nBest Solution Metrics:")
+    best_metrics = fitness_history[best_iteration]
+    print(f"  - Total Energy: {best_metrics['total_energy']:.4f}")
+    print(f"  - Data Energy: {best_metrics['data_energy']:.4f}")
+    print(f"  - Smoothness Energy: {best_metrics['smooth_energy']:.4f}")
+    print(f"  - Intra-cluster Variance: {best_metrics['intra_cluster_variance']:.4f}")
+    print(f"  - Boundary Violations: {best_metrics['boundary_violations']:.4f}")
+    print("="*70 + "\n")
+    
+    return best_labels, best_centers, fitness_history
+
+def labels_to_image(segments, labels):
+    H, W = segments.shape
+    out = np.zeros((H, W), dtype=np.int32)
+    for s, l in enumerate(labels):
+        out[segments == s] = l
+    return out
+
+def visualize_segmentation(img, label_img, K):
+    # color each label by its mean color
+    H, W = label_img.shape
+    out = np.zeros_like(img)
+    for k in range(K):
+        mask = label_img == k
+        if np.any(mask):
+            mean_col = img[mask].mean(axis=0)
+            out[mask] = mean_col
+    return out
+
+def find_input_image(directory):
+    """Try to find the input image with various common extensions"""
+    possible_names = ['input.jpg', 'input.jpeg', 'input.JPG', 'input.JPEG', 
+                      'input.png', 'input.PNG', 'Input.jpg', 'Input.jpeg']
+    
+    for name in possible_names:
+        path = os.path.join(directory, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+def save_fitness_report(fitness_history, output_path):
+    """Save fitness metrics to a text file"""
+    with open(output_path, 'w') as f:
+        f.write("="*70 + "\n")
+        f.write("FITNESS REPORT - Parallel Cellular Segmentation\n")
+        f.write("="*70 + "\n\n")
+        
+        f.write("Iteration-by-Iteration Metrics:\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"{'Iter':<6} {'Fitness':<12} {'Data Energy':<14} {'Smooth Energy':<14} {'Variance':<12}\n")
+        f.write("-" * 70 + "\n")
+        
+        for i, metrics in enumerate(fitness_history):
+            f.write(f"{i+1:<6} {metrics['fitness']:<12.4f} {metrics['data_energy']:<14.4f} "
+                   f"{metrics['smooth_energy']:<14.4f} {metrics['intra_cluster_variance']:<12.4f}\n")
+        
+        f.write("\n" + "="*70 + "\n")
+        
+        # Find best
+        best_idx = min(range(len(fitness_history)), key=lambda i: fitness_history[i]['fitness'])
+        best = fitness_history[best_idx]
+        
+        f.write(f"\nBest Solution (Iteration {best_idx + 1}):\n")
+        f.write(f"  Fitness: {best['fitness']:.4f}\n")
+        f.write(f"  Data Energy: {best['data_energy']:.4f}\n")
+        f.write(f"  Smoothness Energy: {best['smooth_energy']:.4f}\n")
+        f.write(f"  Intra-cluster Variance: {best['intra_cluster_variance']:.4f}\n")
+        f.write(f"  Boundary Violations: {best['boundary_violations']:.4f}\n")
+        
+        f.write("\n" + "="*70 + "\n")
+
+if __name__ == '__main__':
+    # 🟢 Set your directory path here:
+    directory = r"C:\Users\BMSCE\Desktop\1BM23CS148 BIS"
+    
+    # 📁 Diagnostic: Check directory and find image
+    print("📁 Checking directory...")
+    print(f"Directory: {directory}")
+    print(f"Directory exists: {os.path.exists(directory)}")
+    
+    if os.path.exists(directory):
+        print(f"\n📂 Files in directory:")
+        files = os.listdir(directory)
+        for f in files:
+            print(f"  - {f}")
+        
+        # Try to find input image
+        inp = find_input_image(directory)
+        
+        if inp is None:
+            print("\n❌ Could not find input image!")
+            print("Please ensure you have a file named 'input.jpg' (or .jpeg/.png) in the directory.")
+            print("Or update the 'possible_names' list in the code with your exact filename.")
+            sys.exit(1)
+        else:
+            print(f"\n✅ Found input image: {os.path.basename(inp)}")
+    else:
+        print(f"\n❌ Directory does not exist: {directory}")
+        print("Please check the path and update the 'directory' variable.")
+        sys.exit(1)
+    
+    outp = os.path.join(directory, "output.png")
+    fitness_report_path = os.path.join(directory, "fitness_report.txt")
+
+    # Try reading with OpenCV
+    print(f"\n📖 Attempting to read image: {inp}")
+    print(f"File size: {os.path.getsize(inp)} bytes")
+    
+    img = cv2.imread(inp)
+    if img is None:
+        print(f"❌ OpenCV failed to read the image.")
+        print(f"Trying alternative method with PIL/Pillow...")
+        
+        # Try with PIL as backup
+        try:
+            from PIL import Image
+            pil_img = Image.open(inp)
+            print(f"✅ PIL successfully opened image: {pil_img.size}, mode: {pil_img.mode}")
+            img = np.array(pil_img)
+            if len(img.shape) == 2:  # grayscale
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            elif img.shape[2] == 4:  # RGBA
+                img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+            # img is already RGB from PIL
+            print(f"✅ Converted to numpy array: {img.shape}")
+        except Exception as e:
+            print(f"❌ PIL also failed: {e}")
+            print(f"\nThe file might be corrupted. Try:")
+            print(f"1. Open the image in an image viewer to verify it's valid")
+            print(f"2. Re-save it or use a different image")
+            sys.exit(1)
+    else:
+        print(f"✅ OpenCV successfully read image: {img.shape}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # --- Parameters (tweakable) ---
+    n_super = 800          # number of superpixels
+    compactness = 10       # SLIC compactness
+    K = 5                  # final number of labels (segments)
+    smoothness_weight = 0.7
+    sigma = 5.0
+    max_iters = 25
+
+    print("\n🧩 Computing superpixels...")
+    segments = image_to_superpixels(img, n_segments=n_super, compactness=compactness)
+
+    print("📊 Computing features...")
+    feats, counts = compute_superpixel_features(img, segments, include_position=True)
+
+    print("🌐 Building adjacency graph...")
+    neighbors = build_adjacency(segments)
+
+    print("⚡ Calculating boundary strengths...")
+    strengths = compute_boundary_strengths(img, segments)
+
+    print("🎯 Initializing labels using KMeans...")
+    init_labels, centers = init_labels_by_kmeans(feats, K=K, seed=42)
+
+    print("\n🚀 Starting Parallel Cellular Optimization with Fitness Tracking...")
+    print("="*70)
+    labels, centers, fitness_history = parallel_cellular_optimization(
+        feats, neighbors, strengths, init_labels,
+        K=K, smoothness_weight=smoothness_weight,
+        sigma=sigma, max_iters=max_iters
+    )
+
+    label_img = labels_to_image(segments, labels)
+    out_vis = visualize_segmentation(img, label_img, K)
+    out_vis_bgr = cv2.cvtColor(out_vis.astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+    cv2.imwrite(outp, out_vis_bgr)
+    print(f"✅ Segmented image saved to: {outp}")
+    
+    # Save fitness report
+    save_fitness_report(fitness_history, fitness_report_path)
+    print(f"📊 Fitness report saved to: {fitness_report_path}")
+
+    # Optional: display image result
+    cv2.imshow("Segmented Image", out_vis_bgr)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
